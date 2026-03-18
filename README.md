@@ -42,12 +42,19 @@ Options:
 | `--lr` | 1e-4 | Learning rate |
 | `--out-dir` | checkpoints | Where to save model and vocabs |
 | `--cache-dir` | . | Directory for espeak-ng TSV cache (reused when dataset + max_sentences match) |
+| `--resume` | — | Resume training from checkpoint in DIR (loads model, vocabs, config; reuses cached G2P data from the original run; saves back to DIR) |
 | `--voice` | en-us | espeak-ng voice used for IPA |
 
 Example (smaller/faster run):
 
 ```bash
 python train_g2p.py --max-sentences 5000 --epochs 5 --batch-size 32 --out-dir out
+```
+
+Continue training from an existing checkpoint (runs more epochs and saves back to the same dir):
+
+```bash
+python train_g2p.py --resume checkpoints --epochs 5
 ```
 
 Outputs in `--out-dir`:

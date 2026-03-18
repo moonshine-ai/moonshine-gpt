@@ -1,3 +1,4 @@
 /checkpoints
 .venv
 g2p_cache_*.tsv
+*.pyc

@@ -349,57 +349,111 @@ def main():
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--out-dir", type=str, default="checkpoints", help="Save model and vocabs here")
+    parser.add_argument("--out-dir", type=str, default="checkpoints", help="Save model and vocabs here (defaults to --resume path when resuming)")
+    parser.add_argument("--resume", type=str, default=None, metavar="DIR", help="Resume training from checkpoint in DIR (loads model, vocabs, config; uses cached data from original run)")
     parser.add_argument("--cache-dir", type=str, default=".", help="Directory for espeak-ng TSV cache (default: current dir)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--voice", type=str, default="en-us", help="espeak-ng voice for IPA")
     args = parser.parse_args()
 
-    torch.manual_seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.resume:
+        args.out_dir = args.resume  # save back into the same checkpoint dir when resuming
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # 1) Load sentences and get IPA (from cache or espeak-ng)
-    cache_path = os.path.join(args.cache_dir, _cache_basename(args.dataset, args.max_sentences))
-    pairs = load_cached_pairs(cache_path, args.dataset, args.max_sentences)
-    if pairs is not None:
-        print(f"Using cached G2P data from {cache_path} ({len(pairs)} pairs).")
+    torch.manual_seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    resume_dir = args.resume
+    if resume_dir:
+        # Load checkpoint: config, vocabs, model state; then load cached pairs
+        config_path = os.path.join(resume_dir, "config.json")
+        if not os.path.isfile(config_path):
+            raise FileNotFoundError(f"Resume directory must contain config.json: {resume_dir}")
+        with open(config_path) as f:
+            ckpt_config = json.load(f)
+        dataset_name = ckpt_config.get("dataset") or args.dataset
+        ckpt_max_sentences = ckpt_config.get("max_sentences")
+        if ckpt_max_sentences is not None:
+            ckpt_max_sentences = int(ckpt_max_sentences)
+        else:
+            ckpt_max_sentences = args.max_sentences
+        cache_path = os.path.join(args.cache_dir, _cache_basename(dataset_name, ckpt_max_sentences))
+        pairs = load_cached_pairs(cache_path, dataset_name, ckpt_max_sentences)
+        if pairs is None:
+            raise FileNotFoundError(
+                f"Resume requires cached G2P data. Not found: {cache_path} "
+                f"(dataset={dataset_name}, max_sentences={ckpt_max_sentences}). Run without --resume first to create the cache."
+            )
+        print(f"Resuming from {resume_dir}. Using cached data: {len(pairs)} pairs.")
+        src_vocab = CharVocab.load(os.path.join(resume_dir, "src_vocab.json"))
+        tgt_vocab = CharVocab.load(os.path.join(resume_dir, "tgt_vocab.json"))
+        model = G2PTransformer(
+            src_vocab_size=len(src_vocab),
+            tgt_vocab_size=len(tgt_vocab),
+            max_src_len=ckpt_config["max_src_len"],
+            max_tgt_len=ckpt_config["max_tgt_len"],
+            d_model=ckpt_config["d_model"],
+            nhead=ckpt_config["nhead"],
+            num_encoder_layers=ckpt_config["num_layers"],
+            num_decoder_layers=ckpt_config["num_layers"],
+            dim_feedforward=ckpt_config["dim_feedforward"],
+            dropout=ckpt_config["dropout"],
+        ).to(device)
+        state_path = os.path.join(resume_dir, "g2p_transformer.pt")
+        model.load_state_dict(torch.load(state_path, map_location=device, weights_only=True))
+        print(f"Loaded model from {state_path}")
+        # Use checkpoint config for everything so saved config matches the model
+        args.dataset = dataset_name
+        args.max_sentences = ckpt_max_sentences
+        args.max_src_len = ckpt_config["max_src_len"]
+        args.max_tgt_len = ckpt_config["max_tgt_len"]
+        args.d_model = ckpt_config["d_model"]
+        args.nhead = ckpt_config["nhead"]
+        args.num_layers = ckpt_config["num_layers"]
+        args.dim_ff = ckpt_config["dim_feedforward"]
+        args.dropout = ckpt_config["dropout"]
     else:
-        print(f"Loading sentences from WikiText ({args.dataset})...")
-        sentences = list(fetch_sentences_from_wikitext(args.max_sentences, config=args.dataset, min_len=5, max_len=args.max_src_len))
-        print(f"Got {len(sentences)} sentences. Generating IPA with espeak-ng...")
-        pairs = build_ipa_with_espeak(sentences, voice=args.voice)
-        print(f"Collected {len(pairs)} (text, IPA) pairs. Caching to {cache_path}")
-        save_cached_pairs(cache_path, args.dataset, args.max_sentences, pairs)
+        # 1) Load sentences and get IPA (from cache or espeak-ng)
+        cache_path = os.path.join(args.cache_dir, _cache_basename(args.dataset, args.max_sentences))
+        pairs = load_cached_pairs(cache_path, args.dataset, args.max_sentences)
+        if pairs is not None:
+            print(f"Using cached G2P data from {cache_path} ({len(pairs)} pairs).")
+        else:
+            print(f"Loading sentences from WikiText ({args.dataset})...")
+            sentences = list(fetch_sentences_from_wikitext(args.max_sentences, config=args.dataset, min_len=5, max_len=args.max_src_len))
+            print(f"Got {len(sentences)} sentences. Generating IPA with espeak-ng...")
+            pairs = build_ipa_with_espeak(sentences, voice=args.voice)
+            print(f"Collected {len(pairs)} (text, IPA) pairs. Caching to {cache_path}")
+            save_cached_pairs(cache_path, args.dataset, args.max_sentences, pairs)
 
-    if len(pairs) < 100:
-        raise RuntimeError("Too few pairs; install espeak-ng and ensure py-espeak-ng works.")
+        if len(pairs) < 100:
+            raise RuntimeError("Too few pairs; install espeak-ng and ensure py-espeak-ng works.")
 
-    # 2) Build vocabs
-    src_vocab = CharVocab()
-    tgt_vocab = CharVocab()
-    for text, ipa in pairs:
-        src_vocab.add(text)
-        tgt_vocab.add(ipa)
-    print(f"Source vocab size: {len(src_vocab)}, target vocab size: {len(tgt_vocab)}")
+        # 2) Build vocabs
+        src_vocab = CharVocab()
+        tgt_vocab = CharVocab()
+        for text, ipa in pairs:
+            src_vocab.add(text)
+            tgt_vocab.add(ipa)
+        print(f"Source vocab size: {len(src_vocab)}, target vocab size: {len(tgt_vocab)}")
 
-    # 3) Dataset and loader
+        # 3) Model (dataset/loader built below for both branches)
+        model = G2PTransformer(
+            src_vocab_size=len(src_vocab),
+            tgt_vocab_size=len(tgt_vocab),
+            d_model=args.d_model,
+            nhead=args.nhead,
+            num_encoder_layers=args.num_layers,
+            num_decoder_layers=args.num_layers,
+            dim_feedforward=args.dim_ff,
+            dropout=args.dropout,
+            max_src_len=args.max_src_len,
+            max_tgt_len=args.max_tgt_len,
+        ).to(device)
+
+    # Dataset and loader (shared by resume and fresh)
     dataset = G2PDataset(pairs, src_vocab, tgt_vocab, args.max_src_len, args.max_tgt_len)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_g2p, num_workers=0)
-
-    # 4) Model
-    model = G2PTransformer(
-        src_vocab_size=len(src_vocab),
-        tgt_vocab_size=len(tgt_vocab),
-        d_model=args.d_model,
-        nhead=args.nhead,
-        num_encoder_layers=args.num_layers,
-        num_decoder_layers=args.num_layers,
-        dim_feedforward=args.dim_ff,
-        dropout=args.dropout,
-        max_src_len=args.max_src_len,
-        max_tgt_len=args.max_tgt_len,
-    ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     # 5) Train
@@ -419,6 +473,8 @@ def main():
         "dropout": args.dropout,
         "max_src_len": args.max_src_len,
         "max_tgt_len": args.max_tgt_len,
+        "dataset": args.dataset,
+        "max_sentences": args.max_sentences,
     }
     with open(os.path.join(args.out_dir, "config.json"), "w") as f:
         json.dump(config, f)
