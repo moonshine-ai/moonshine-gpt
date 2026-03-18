@@ -41,6 +41,7 @@ Options:
 | `--epochs` | 10 | Training epochs |
 | `--lr` | 1e-4 | Learning rate |
 | `--out-dir` | checkpoints | Where to save model and vocabs |
+| `--cache-dir` | . | Directory for espeak-ng TSV cache (reused when dataset + max_sentences match) |
 | `--voice` | en-us | espeak-ng voice used for IPA |
 
 Example (smaller/faster run):
@@ -65,6 +66,7 @@ Outputs in `--out-dir`:
 
 - **Source**: Hugging Face `wikitext` dataset. Default config is `wikitext-103-raw-v1` (WikiText-103, ~1.8M train lines); use `--dataset wikitext-2-raw-v1` for the smaller WikiText-2 (~37k lines). Only the train split is used; lines are filtered by length (5–256 chars) and section headers are skipped.
 - **Target**: Each selected line is passed to `espeakng.ESpeakNG().g2p(text, ipa=2)` to obtain IPA. Pairs where `g2p` fails or returns empty are dropped.
+- **Cache**: The (text, IPA) pairs are written to a TSV file under `--cache-dir` (default: current directory), with a first-line header encoding the data source and `max_sentences` (e.g. `# dataset=wikitext-103-raw-v1 max_sentences=20000`). Re-runs with the same `--dataset` and `--max-sentences` reuse this cache and skip espeak-ng. Cache files are named like `g2p_cache_wikitext-103-raw-v1_20000.tsv`.
 
 ## Inference
 

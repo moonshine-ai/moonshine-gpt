@@ -5,9 +5,11 @@ Uses WikiText-2 as the text corpus and py-espeak-ng for IPA ground truth.
 """
 
 import argparse
+import csv
 import json
 import math
 import os
+import re
 
 import torch
 import torch.nn as nn
@@ -120,6 +122,55 @@ def build_ipa_with_espeak(sentences: list[str], voice: str = "en-us") -> list[tu
         except Exception:
             continue
     return out
+
+
+# ------------------------------------------------------------------------------
+# Cache: TSV with metadata (dataset name + n_sentences) for reuse
+# ------------------------------------------------------------------------------
+
+def _cache_basename(dataset: str, max_sentences: int) -> str:
+    """Safe filename component from dataset config and max_sentences."""
+    safe = re.sub(r"[^\w\-]", "_", dataset)
+    return f"g2p_cache_{safe}_{max_sentences}.tsv"
+
+
+def load_cached_pairs(cache_path: str, dataset: str, max_sentences: int) -> list[tuple[str, str]] | None:
+    """Load (text, ipa) pairs from cache if it exists and matches dataset + max_sentences."""
+    if not os.path.isfile(cache_path):
+        return None
+    pairs = []
+    with open(cache_path, "r", encoding="utf-8", newline="") as f:
+        first = f.readline().strip()
+        if not first.startswith("# dataset=") or " max_sentences=" not in first:
+            return None
+        # Parse "# dataset=wikitext-103-raw-v1 max_sentences=20000"
+        parts = first[2:].strip().split()
+        meta = {}
+        for p in parts:
+            k, v = p.split("=", 1)
+            meta[k] = v
+        if meta.get("dataset") != dataset or meta.get("max_sentences") != str(max_sentences):
+            return None
+        reader = csv.reader(f, delimiter="\t", quoting=csv.QUOTE_MINIMAL)
+        header = next(reader, None)
+        if header != ["text", "ipa"]:
+            return None
+        for row in reader:
+            if len(row) == 2:
+                pairs.append((row[0], row[1]))
+    return pairs if pairs else None
+
+
+def save_cached_pairs(cache_path: str, dataset: str, max_sentences: int, pairs: list[tuple[str, str]]) -> None:
+    """Write (text, ipa) pairs to TSV with metadata header."""
+    d = os.path.dirname(cache_path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(cache_path, "w", encoding="utf-8", newline="") as f:
+        f.write(f"# dataset={dataset} max_sentences={max_sentences}\n")
+        writer = csv.writer(f, delimiter="\t", quoting=csv.QUOTE_MINIMAL)
+        writer.writerow(["text", "ipa"])
+        writer.writerows(pairs)
 
 
 # ------------------------------------------------------------------------------
@@ -299,6 +350,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--out-dir", type=str, default="checkpoints", help="Save model and vocabs here")
+    parser.add_argument("--cache-dir", type=str, default=".", help="Directory for espeak-ng TSV cache (default: current dir)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--voice", type=str, default="en-us", help="espeak-ng voice for IPA")
     args = parser.parse_args()
@@ -307,12 +359,18 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # 1) Load sentences and get IPA from espeak-ng
-    print(f"Loading sentences from WikiText ({args.dataset})...")
-    sentences = list(fetch_sentences_from_wikitext(args.max_sentences, config=args.dataset, min_len=5, max_len=args.max_src_len))
-    print(f"Got {len(sentences)} sentences. Generating IPA with espeak-ng...")
-    pairs = build_ipa_with_espeak(sentences, voice=args.voice)
-    print(f"Collected {len(pairs)} (text, IPA) pairs.")
+    # 1) Load sentences and get IPA (from cache or espeak-ng)
+    cache_path = os.path.join(args.cache_dir, _cache_basename(args.dataset, args.max_sentences))
+    pairs = load_cached_pairs(cache_path, args.dataset, args.max_sentences)
+    if pairs is not None:
+        print(f"Using cached G2P data from {cache_path} ({len(pairs)} pairs).")
+    else:
+        print(f"Loading sentences from WikiText ({args.dataset})...")
+        sentences = list(fetch_sentences_from_wikitext(args.max_sentences, config=args.dataset, min_len=5, max_len=args.max_src_len))
+        print(f"Got {len(sentences)} sentences. Generating IPA with espeak-ng...")
+        pairs = build_ipa_with_espeak(sentences, voice=args.voice)
+        print(f"Collected {len(pairs)} (text, IPA) pairs. Caching to {cache_path}")
+        save_cached_pairs(cache_path, args.dataset, args.max_sentences, pairs)
 
     if len(pairs) < 100:
         raise RuntimeError("Too few pairs; install espeak-ng and ensure py-espeak-ng works.")
