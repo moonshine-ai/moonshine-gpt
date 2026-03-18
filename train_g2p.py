@@ -86,11 +86,11 @@ class CharVocab:
 # Data: WikiText + espeak-ng IPA
 # ------------------------------------------------------------------------------
 
-def fetch_sentences_from_wikitext(max_sentences: int, min_len: int = 10, max_len: int = 120):
-    """Yield English text lines from WikiText-2 (raw)."""
+def fetch_sentences_from_wikitext(max_sentences: int, config: str = "wikitext-103-raw-v1", min_len: int = 5, max_len: int = 300):
+    """Yield English text lines from WikiText (raw). Use config 'wikitext-103-raw-v1' for ~1.8M lines, 'wikitext-2-raw-v1' for ~37k."""
     if load_dataset is None:
         raise ImportError("Install 'datasets': pip install datasets")
-    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train", trust_remote_code=True)
+    ds = load_dataset("wikitext", config, split="train")
     n = 0
     for ex in ds:
         text = (ex.get("text") or "").strip()
@@ -286,8 +286,9 @@ def predict(model: G2PTransformer, src_vocab: CharVocab, tgt_vocab: CharVocab, t
 
 def main():
     parser = argparse.ArgumentParser(description="Train G2P Transformer (text → IPA)")
-    parser.add_argument("--max-sentences", type=int, default=20_000, help="Max training sentences from WikiText")
-    parser.add_argument("--max-src-len", type=int, default=150, help="Max source (grapheme) length")
+    parser.add_argument("--max-sentences", type=int, default=20_000, help="Max training sentences to use")
+    parser.add_argument("--dataset", type=str, default="wikitext-103-raw-v1", choices=["wikitext-2-raw-v1", "wikitext-103-raw-v1"], help="WikiText config: 103 has ~1.8M train lines, 2 has ~37k")
+    parser.add_argument("--max-src-len", type=int, default=256, help="Max source (grapheme) length")
     parser.add_argument("--max-tgt-len", type=int, default=200, help="Max target (IPA) length")
     parser.add_argument("--d-model", type=int, default=256, help="Transformer dimension")
     parser.add_argument("--nhead", type=int, default=8, help="Number of attention heads")
@@ -307,8 +308,8 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     # 1) Load sentences and get IPA from espeak-ng
-    print("Loading WikiText-2 sentences...")
-    sentences = list(fetch_sentences_from_wikitext(args.max_sentences, min_len=10, max_len=args.max_src_len))
+    print(f"Loading sentences from WikiText ({args.dataset})...")
+    sentences = list(fetch_sentences_from_wikitext(args.max_sentences, config=args.dataset, min_len=5, max_len=args.max_src_len))
     print(f"Got {len(sentences)} sentences. Generating IPA with espeak-ng...")
     pairs = build_ipa_with_espeak(sentences, voice=args.voice)
     print(f"Collected {len(pairs)} (text, IPA) pairs.")

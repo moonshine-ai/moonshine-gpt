@@ -1,6 +1,6 @@
 # G2P Transformer (English text → IPA)
 
-Train a small Transformer that maps English text to IPA phonemes. Training uses **WikiText-2** as the text corpus and **espeak-ng** (via the `py-espeak-ng` Python package) to generate ground-truth IPA for each sentence.
+Train a small Transformer that maps English text to IPA phonemes. Training uses **WikiText** (by default WikiText-103, ~1.8M lines) as the text corpus and **espeak-ng** (via the `py-espeak-ng` Python package) to generate ground-truth IPA for each sentence.
 
 ## Requirements
 
@@ -28,8 +28,9 @@ Options:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--max-sentences` | 20000 | Max training sentences from WikiText-2 |
-| `--max-src-len` | 150 | Max grapheme sequence length |
+| `--max-sentences` | 20000 | Max training sentences to use |
+| `--dataset` | wikitext-103-raw-v1 | WikiText config: `wikitext-103-raw-v1` (~1.8M lines) or `wikitext-2-raw-v1` (~37k) |
+| `--max-src-len` | 256 | Max grapheme sequence length |
 | `--max-tgt-len` | 200 | Max IPA sequence length |
 | `--d-model` | 256 | Transformer dimension |
 | `--nhead` | 8 | Number of attention heads |
@@ -62,7 +63,7 @@ Outputs in `--out-dir`:
 
 ## Data
 
-- **Source**: Hugging Face `wikitext` dataset, config `wikitext-2-raw-v1` (WikiText-2 raw). Only the train split is used; lines are filtered by length and section headers are skipped.
+- **Source**: Hugging Face `wikitext` dataset. Default config is `wikitext-103-raw-v1` (WikiText-103, ~1.8M train lines); use `--dataset wikitext-2-raw-v1` for the smaller WikiText-2 (~37k lines). Only the train split is used; lines are filtered by length (5–256 chars) and section headers are skipped.
 - **Target**: Each selected line is passed to `espeakng.ESpeakNG().g2p(text, ipa=2)` to obtain IPA. Pairs where `g2p` fails or returns empty are dropped.
 
 ## Inference
