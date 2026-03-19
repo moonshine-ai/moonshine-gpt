@@ -11,6 +11,7 @@ import math
 import os
 import random
 import re
+import signal
 
 import torch
 import torch.nn as nn
@@ -114,12 +115,30 @@ def build_ipa_with_espeak(sentences: list[str], voice: str = "en-us") -> list[tu
     esng = ESpeakNG()
     esng.voice = voice
     out = []
+
+    class _G2PTimeout(Exception):
+        """Raised when espeak-ng G2P exceeds per-item timeout."""
+        pass
+
+    def _timeout_handler(signum, frame):
+        raise _G2PTimeout()
+
     for text in tqdm(sentences, desc="G2P (espeak-ng)"):
         try:
-            ipa = esng.g2p(text, ipa=2)
+            # Enforce a per-item timeout so a hung g2p call doesn't block the run.
+            prev_handler = signal.getsignal(signal.SIGALRM)
+            signal.signal(signal.SIGALRM, _timeout_handler)
+            signal.setitimer(signal.ITIMER_REAL, 1.0)
+            try:
+                ipa = esng.g2p(text, ipa=2)
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, prev_handler)
             if ipa and isinstance(ipa, str) and ipa.strip():
                 ipa = ipa.strip()
                 out.append((text, ipa))
+        except _G2PTimeout:
+            continue
         except Exception:
             continue
     return out
