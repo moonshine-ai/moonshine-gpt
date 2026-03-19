@@ -9,6 +9,7 @@ import csv
 import json
 import math
 import os
+import random
 import re
 
 import torch
@@ -125,6 +126,44 @@ def build_ipa_with_espeak(sentences: list[str], voice: str = "en-us") -> list[tu
 
 
 # ------------------------------------------------------------------------------
+# Data: dictionary word list (single words)
+# ------------------------------------------------------------------------------
+
+# Common column names for word in HF datasets (try in order)
+WORD_COLUMN_CANDIDATES = ("Word", "word", "token", "text", "words")
+
+
+def fetch_words_from_dict(
+    dict_dataset: str, max_words: int, min_len: int = 1, max_len: int = 64, dict_config: str | None = None
+) -> list[str]:
+    """Yield single words from a Hugging Face dataset (e.g. Maximax67/English-Valid-Words)."""
+    if load_dataset is None:
+        raise ImportError("Install 'datasets': pip install datasets")
+    if dict_config:
+        ds = load_dataset(dict_dataset, dict_config, split="train")
+    else:
+        ds = load_dataset(dict_dataset, split="train")
+    if hasattr(ds, "column_names") and ds.column_names:
+        cols = ds.column_names
+        word_col = next((c for c in WORD_COLUMN_CANDIDATES if c in cols), cols[0])
+    else:
+        word_col = "Word"
+    n = 0
+    out = []
+    for ex in ds:
+        w = (ex.get(word_col) or ex.get(word_col.lower()) or "").strip()
+        if not w or len(w) < min_len or len(w) > max_len:
+            continue
+        if not w.isalpha():  # skip if any non-letter
+            continue
+        out.append(w)
+        n += 1
+        if n >= max_words:
+            break
+    return out
+
+
+# ------------------------------------------------------------------------------
 # Cache: TSV with metadata (dataset name + n_sentences) for reuse
 # ------------------------------------------------------------------------------
 
@@ -168,6 +207,65 @@ def save_cached_pairs(cache_path: str, dataset: str, max_sentences: int, pairs: 
         os.makedirs(d, exist_ok=True)
     with open(cache_path, "w", encoding="utf-8", newline="") as f:
         f.write(f"# dataset={dataset} max_sentences={max_sentences}\n")
+        writer = csv.writer(f, delimiter="\t", quoting=csv.QUOTE_MINIMAL)
+        writer.writerow(["text", "ipa"])
+        writer.writerows(pairs)
+
+
+def _cache_basename_dict(dict_dataset: str, max_words: int, dict_config: str | None = None) -> str:
+    """Safe filename for dictionary G2P cache."""
+    safe = re.sub(r"[^\w\-]", "_", dict_dataset.replace("/", "_"))
+    if dict_config:
+        safe_cfg = re.sub(r"[^\w\-]", "_", dict_config)
+        return f"g2p_cache_dict_{safe}_{safe_cfg}_{max_words}.tsv"
+    return f"g2p_cache_dict_{safe}_{max_words}.tsv"
+
+
+def load_cached_pairs_dict(
+    cache_path: str, dict_dataset: str, max_words: int, dict_config: str | None = None
+) -> list[tuple[str, str]] | None:
+    """Load (word, ipa) pairs from dict cache if it exists and matches."""
+    if not os.path.isfile(cache_path):
+        return None
+    pairs = []
+    with open(cache_path, "r", encoding="utf-8", newline="") as f:
+        first = f.readline().strip()
+        if not first.startswith("# source=dict") or " dataset=" not in first or " max_words=" not in first:
+            return None
+        parts = first[2:].strip().split()
+        meta = {}
+        for p in parts:
+            k, v = p.split("=", 1)
+            meta[k] = v
+        if meta.get("dataset") != dict_dataset or meta.get("max_words") != str(max_words):
+            return None
+        if dict_config is not None and meta.get("config") != dict_config:
+            return None
+        if dict_config is None and meta.get("config") is not None:
+            return None
+        reader = csv.reader(f, delimiter="\t", quoting=csv.QUOTE_MINIMAL)
+        header = next(reader, None)
+        if header != ["text", "ipa"]:
+            return None
+        for row in reader:
+            if len(row) == 2:
+                pairs.append((row[0], row[1]))
+    return pairs if pairs else None
+
+
+def save_cached_pairs_dict(
+    cache_path: str, dict_dataset: str, max_words: int, pairs: list[tuple[str, str]], dict_config: str | None = None
+) -> None:
+    """Write dict (word, ipa) pairs to TSV with metadata header."""
+    d = os.path.dirname(cache_path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    meta = f"# source=dict dataset={dict_dataset} max_words={max_words}"
+    if dict_config:
+        meta += f" config={dict_config}"
+    meta += "\n"
+    with open(cache_path, "w", encoding="utf-8", newline="") as f:
+        f.write(meta)
         writer = csv.writer(f, delimiter="\t", quoting=csv.QUOTE_MINIMAL)
         writer.writerow(["text", "ipa"])
         writer.writerows(pairs)
@@ -339,6 +437,9 @@ def main():
     parser = argparse.ArgumentParser(description="Train G2P Transformer (text → IPA)")
     parser.add_argument("--max-sentences", type=int, default=20_000, help="Max training sentences to use")
     parser.add_argument("--dataset", type=str, default="wikitext-103-raw-v1", choices=["wikitext-2-raw-v1", "wikitext-103-raw-v1"], help="WikiText config: 103 has ~1.8M train lines, 2 has ~37k")
+    parser.add_argument("--dict-dataset", type=str, default="Maximax67/English-Valid-Words", metavar="HF_NAME", help="Add single-word pairs from a HF dataset (e.g. Maximax67/English-Valid-Words)")
+    parser.add_argument("--dict-config", type=str, default="sorted_by_frequency", metavar="CONFIG", help="Config name for --dict-dataset if required (e.g. sorted_by_frequency for Maximax67/English-Valid-Words)")
+    parser.add_argument("--max-dict-words", type=int, default=10_000, help="Max single words to add when --dict-dataset is set")
     parser.add_argument("--max-src-len", type=int, default=256, help="Max source (grapheme) length")
     parser.add_argument("--max-tgt-len", type=int, default=200, help="Max target (IPA) length")
     parser.add_argument("--d-model", type=int, default=256, help="Transformer dimension")
@@ -385,6 +486,23 @@ def main():
                 f"(dataset={dataset_name}, max_sentences={ckpt_max_sentences}). Run without --resume first to create the cache."
             )
         print(f"Resuming from {resume_dir}. Using cached data: {len(pairs)} pairs.")
+        dict_dataset_ckpt = ckpt_config.get("dict_dataset")
+        dict_max_words_ckpt = ckpt_config.get("max_dict_words")
+        dict_config_ckpt = ckpt_config.get("dict_config")
+        if dict_dataset_ckpt and dict_max_words_ckpt is not None:
+            dict_max_words_ckpt = int(dict_max_words_ckpt)
+            dict_cache_path = os.path.join(
+                args.cache_dir, _cache_basename_dict(dict_dataset_ckpt, dict_max_words_ckpt, dict_config_ckpt)
+            )
+            dict_pairs = load_cached_pairs_dict(
+                dict_cache_path, dict_dataset_ckpt, dict_max_words_ckpt, dict_config_ckpt
+            )
+            if dict_pairs is not None:
+                pairs = pairs + dict_pairs
+                random.shuffle(pairs)
+                print(f"Added {len(dict_pairs)} dict-word pairs (total {len(pairs)}).")
+            else:
+                print(f"Warning: checkpoint used dict_dataset={dict_dataset_ckpt} but cache not found at {dict_cache_path}; resuming without dict words.")
         src_vocab = CharVocab.load(os.path.join(resume_dir, "src_vocab.json"))
         tgt_vocab = CharVocab.load(os.path.join(resume_dir, "tgt_vocab.json"))
         model = G2PTransformer(
@@ -412,6 +530,9 @@ def main():
         args.num_layers = ckpt_config["num_layers"]
         args.dim_ff = ckpt_config["dim_feedforward"]
         args.dropout = ckpt_config["dropout"]
+        args.dict_dataset = ckpt_config.get("dict_dataset")
+        args.max_dict_words = int(ckpt_config["max_dict_words"]) if ckpt_config.get("max_dict_words") is not None else getattr(args, "max_dict_words", 10_000)
+        args.dict_config = ckpt_config.get("dict_config")
     else:
         # 1) Load sentences and get IPA (from cache or espeak-ng)
         cache_path = os.path.join(args.cache_dir, _cache_basename(args.dataset, args.max_sentences))
@@ -428,6 +549,34 @@ def main():
 
         if len(pairs) < 100:
             raise RuntimeError("Too few pairs; install espeak-ng and ensure py-espeak-ng works.")
+
+        # Optional: add single-word pairs from a dictionary dataset
+        if args.dict_dataset:
+            dict_cache_path = os.path.join(
+                args.cache_dir, _cache_basename_dict(args.dict_dataset, args.max_dict_words, getattr(args, "dict_config", None))
+            )
+            dict_pairs = load_cached_pairs_dict(
+                dict_cache_path, args.dict_dataset, args.max_dict_words, getattr(args, "dict_config", None)
+            )
+            if dict_pairs is not None:
+                print(f"Using cached dict words from {dict_cache_path} ({len(dict_pairs)} pairs).")
+            else:
+                print(f"Loading words from dictionary dataset {args.dict_dataset}...")
+                words = fetch_words_from_dict(
+                    args.dict_dataset,
+                    args.max_dict_words,
+                    min_len=1,
+                    max_len=min(64, args.max_src_len),
+                    dict_config=getattr(args, "dict_config", None),
+                )
+                print(f"Got {len(words)} words. Generating IPA with espeak-ng...")
+                dict_pairs = build_ipa_with_espeak(words, voice=args.voice)
+                print(f"Collected {len(dict_pairs)} (word, IPA) pairs. Caching to {dict_cache_path}")
+                save_cached_pairs_dict(
+                    dict_cache_path, args.dict_dataset, args.max_dict_words, dict_pairs, getattr(args, "dict_config", None)
+                )
+            pairs = pairs + dict_pairs
+            random.shuffle(pairs)
 
         # 2) Build vocabs
         src_vocab = CharVocab()
@@ -476,6 +625,11 @@ def main():
         "dataset": args.dataset,
         "max_sentences": args.max_sentences,
     }
+    if getattr(args, "dict_dataset", None):
+        config["dict_dataset"] = args.dict_dataset
+        config["max_dict_words"] = getattr(args, "max_dict_words", 10_000)
+        if getattr(args, "dict_config", None):
+            config["dict_config"] = args.dict_config
     with open(os.path.join(args.out_dir, "config.json"), "w") as f:
         json.dump(config, f)
     print(f"Saved model and vocabs to {args.out_dir}")

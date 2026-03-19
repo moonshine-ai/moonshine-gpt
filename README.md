@@ -30,6 +30,9 @@ Options:
 |------|---------|-------------|
 | `--max-sentences` | 20000 | Max training sentences to use |
 | `--dataset` | wikitext-103-raw-v1 | WikiText config: `wikitext-103-raw-v1` (~1.8M lines) or `wikitext-2-raw-v1` (~37k) |
+| `--dict-dataset` | — | Add single-word (text, IPA) pairs from a Hugging Face word list (e.g. `Maximax67/English-Valid-Words`) |
+| `--dict-config` | — | Config name if the dataset requires one (e.g. `sorted_by_frequency` for Maximax67/English-Valid-Words) |
+| `--max-dict-words` | 10000 | Max words to add when `--dict-dataset` is set |
 | `--max-src-len` | 256 | Max grapheme sequence length |
 | `--max-tgt-len` | 200 | Max IPA sequence length |
 | `--d-model` | 256 | Transformer dimension |
@@ -49,6 +52,12 @@ Example (smaller/faster run):
 
 ```bash
 python train_g2p.py --max-sentences 5000 --epochs 5 --batch-size 32 --out-dir out
+```
+
+Add single-word examples from a dictionary dataset (cached separately; good for G2P on isolated words). Some datasets require a config (e.g. `Maximax67/English-Valid-Words` needs `--dict-config sorted_by_frequency`):
+
+```bash
+python train_g2p.py --dict-dataset Maximax67/English-Valid-Words --dict-config sorted_by_frequency --max-dict-words 15000
 ```
 
 Continue training from an existing checkpoint (runs more epochs and saves back to the same dir):
