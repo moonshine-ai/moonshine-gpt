@@ -9,11 +9,33 @@ import os
 HEADER = ["text", "ipa"]
 
 
+def write_tsv_table(
+    path: str,
+    header: list[str],
+    rows: list[tuple],
+    comments: list[str] | None = None,
+) -> None:
+    """Write a TSV with optional ``#`` comment lines, then *header* and *rows*."""
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        for line in comments or []:
+            line = line.rstrip("\n")
+            if not line.startswith("#"):
+                line = "# " + line.lstrip()
+            f.write(line + "\n")
+        writer = csv.writer(f, delimiter="\t", quoting=csv.QUOTE_MINIMAL)
+        writer.writerow(header)
+        writer.writerows(rows)
+
+
 def load_pairs_from_tsv_dir(data_dir: str) -> list[tuple[str, str]]:
     """Load and concatenate all ``*.tsv`` files in *data_dir* (sorted by path).
 
-    Each file must contain optional ``#`` comment lines, then a header row
-    ``text<TAB>ipa``, then one pair per row.
+    Each file must contain optional ``#`` comment lines, then a header row whose
+    first two columns are ``text`` and ``ipa`` (extra columns are ignored), then
+    one pair per row.
     """
     if not os.path.isdir(data_dir):
         raise FileNotFoundError(f"Data directory not found: {data_dir}")
@@ -38,8 +60,10 @@ def _load_pairs_from_tsv_file(path: str) -> list[tuple[str, str]]:
                 continue
             if not header_seen:
                 normalized = [c.strip() for c in row]
-                if normalized != HEADER:
-                    raise ValueError(f"{path}: expected header row {HEADER!r}, got {row!r}")
+                if len(normalized) < 2 or normalized[0] != "text" or normalized[1] != "ipa":
+                    raise ValueError(
+                        f"{path}: expected header starting with {HEADER!r}, got {row!r}"
+                    )
                 header_seen = True
                 continue
             if len(row) >= 2:
@@ -51,15 +75,4 @@ def _load_pairs_from_tsv_file(path: str) -> list[tuple[str, str]]:
 
 def write_pairs_tsv(path: str, pairs: list[tuple[str, str]], comments: list[str] | None = None) -> None:
     """Write TSV with optional comment lines (each line should start with ``#``)."""
-    d = os.path.dirname(path)
-    if d:
-        os.makedirs(d, exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        for line in comments or []:
-            line = line.rstrip("\n")
-            if not line.startswith("#"):
-                line = "# " + line.lstrip()
-            f.write(line + "\n")
-        writer = csv.writer(f, delimiter="\t", quoting=csv.QUOTE_MINIMAL)
-        writer.writerow(HEADER)
-        writer.writerows(pairs)
+    write_tsv_table(path, HEADER, pairs, comments)

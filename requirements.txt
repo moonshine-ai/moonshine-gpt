@@ -1,4 +1,6 @@
 torch>=2.0.0
 datasets>=2.14.0
+huggingface_hub>=0.20.0
+certifi>=2023.0.0
 py-espeak-ng>=0.1.8
 tqdm>=4.65.0

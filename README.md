@@ -1,6 +1,6 @@
 # G2P Transformer (English text → IPA)
 
-Train a small Transformer that maps English text to IPA phonemes. **Training data** is a folder of tab-separated files (`text<TAB>ipa`). You build those files with two optional pipelines: **WikiText sentences → espeak-ng** (`build_corpus_tsv.py`) and **Hugging Face word list → espeak-ng** (`build_dictionary_tsv.py`).
+Train a small Transformer that maps English text to IPA phonemes. **Training data** is a folder of tab-separated files (`text<TAB>ipa`). You can build TSVs with **WikiText → espeak-ng** (`build_corpus_tsv.py`), **HF word list → espeak-ng** (`build_dictionary_tsv.py`), **[librig2p-nostress](https://huggingface.co/datasets/flexthink/librig2p-nostress)** (`build_librig2p_nostress_tsv.py`), or **[CMUdict](https://github.com/cmusphinx/cmudict)** (`build_cmudict_tsv.py`); the last three use ARPAbet → Unicode IPA in `arpabet_ipa.py` (no espeak-ng).
 
 ## Requirements
 
@@ -29,6 +29,24 @@ Dictionary words + IPA (example HF dataset):
 ```bash
 python build_dictionary_tsv.py -o data/dictionary.tsv --max-words 10000
 ```
+
+[LibriG2P (no stress)](https://huggingface.co/datasets/flexthink/librig2p-nostress) lexicon or sentence splits (downloads `dataset/<split>.json` via `huggingface_hub`):
+
+```bash
+python build_librig2p_nostress_tsv.py -o data/librig2p_lex.tsv --split lexicon_train
+# optional: --json-path /path/to/lexicon_train.json  --max-rows 50000  --skip-unknown-phonemes
+```
+
+[CMU Pronouncing Dictionary](https://github.com/cmusphinx/cmudict) (`cmudict.dict` from GitHub by default):
+
+```bash
+python build_cmudict_tsv.py -o data/cmudict.tsv
+# optional: --cmudict-path ./cmudict.dict  --lowercase  --download-cache ~/.cache/cmudict.dict
+# default TSV has a third column ``ambiguous`` (true/false); training still uses only text+ipa
+# use --no-ambiguous-column for a two-column file
+```
+
+Phoneme tokens (`phn`) are treated as stress-free ARPAbet (trailing `0`/`1`/`2` stripped if present), mapped to IPA, and concatenated into one string per example so the target side stays character-level like the other TSV builders. IPA symbols and conventions can differ from espeak-ng; mixing this TSV with espeak-built TSVs in one `--data-dir` is allowed but may widen the target alphabet. CMUdict and LibriG2P exports share the same mapping in `arpabet_ipa.py`.
 
 Put one or more `*.tsv` files in a directory (e.g. `data/`) and point training at that folder. Files are read in sorted path order and concatenated.
 
@@ -84,13 +102,13 @@ Outputs in `--out-dir`:
 
 ## Data format
 
-Each TSV may start with `#` comment lines, then a header row exactly:
+Each TSV may start with `#` comment lines, then a header row whose first two columns are `text` and `ipa` (additional columns are ignored by training):
 
 ```text
 text	ipa
 ```
 
-Then one training pair per row. The loader in `g2p_tsv_io.py` merges every `*.tsv` in `--data-dir`.
+Then one training pair per row. The loader in `g2p_tsv_io.py` merges every `*.tsv` in `--data-dir`. CMUdict exports may add `ambiguous` (see above).
 
 ## Inference
 
