@@ -10,7 +10,7 @@ import torch
 
 # Import from train script (same dir)
 from g2p_lexicon import CmuDictLexicon
-from train_g2p import CharVocab, G2PTransformer, predict
+from train_g2p import CharVocab, G2PTransformer, predict, predict_lexicon_windowed
 
 
 def main():
@@ -18,6 +18,18 @@ def main():
     parser.add_argument("text", nargs="?", default=None, help="Input text (or read from stdin)")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Directory with g2p_transformer.pt and vocabs")
     parser.add_argument("--device", type=str, default=None, help="Device (cuda/cpu); default auto")
+    parser.add_argument(
+        "--lexicon-full-sentence",
+        action="store_true",
+        help="With lexicon: single forward pass on the full hybrid (disable per-unknown windows).",
+    )
+    parser.add_argument(
+        "--unknown-context-chars",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Hybrid chars before/after each <u>…</u> when using windowed lexicon inference (default: config or 48).",
+    )
     args = parser.parse_args()
 
     ckpt_dir = args.checkpoint_dir
@@ -65,7 +77,23 @@ def main():
         print("No input text.", file=sys.stderr)
         sys.exit(1)
 
-    ipa = predict(model, src_vocab, tgt_vocab, text, device, lexicon=lexicon)
+    ctx_n = args.unknown_context_chars
+    if ctx_n is None:
+        ctx_n = int(config.get("unknown_context_chars", 48))
+
+    if lexicon is not None and not args.lexicon_full_sentence:
+        ipa = predict_lexicon_windowed(
+            model,
+            src_vocab,
+            tgt_vocab,
+            text,
+            device,
+            lexicon=lexicon,
+            unknown_context_chars=ctx_n,
+            max_src_len=config.get("max_src_len", 0),
+        )
+    else:
+        ipa = predict(model, src_vocab, tgt_vocab, text, device, lexicon=lexicon)
     print(ipa)
 
 

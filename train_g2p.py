@@ -9,6 +9,13 @@ By default the encoder sees a *hybrid* source built from the lexicon TSV (``--di
 default ``<data-dir>/dict.tsv``): dictionary
 entries with a single IPA are wrapped as ``<k>…</k>``; ambiguous / OOV tokens and
 punctuation use ``<u>…</u>``. Use ``--no-lexicon`` for raw grapheme input only.
+
+At inference, lexicon checkpoints default to *windowed* decoding (``infer.py``): each ``<u>…</u>``
+is predicted in its own forward pass with local hybrid context, then spliced back before the next unknown.
+
+With a lexicon, **training** matches that setup by default: each TSV row expands to one example per
+``<u>…</u>`` (teacher-forced gold for earlier unknowns in the hybrid). Use ``--lexicon-train-full-sentence``
+for the older full-sequence objective.
 """
 
 import argparse
@@ -21,7 +28,15 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
-from g2p_lexicon import CmuDictLexicon
+from g2p_lexicon import (
+    CmuDictLexicon,
+    UNKNOWN_U_RE,
+    clip_hybrid_window,
+    extract_ipa_for_target_unknown,
+    hybrid_all_known_to_ipa,
+    hybrid_context_window_bounds,
+    iter_lexicon_window_training_pairs,
+)
 from g2p_tsv_io import load_pairs_from_tsv_dir
 
 
@@ -95,6 +110,7 @@ class G2PDataset(Dataset):
         max_src: int,
         max_tgt: int,
         lexicon: CmuDictLexicon | None = None,
+        src_is_prehybrid: bool = False,
     ):
         self.pairs = pairs
         self.src_vocab = src_vocab
@@ -102,13 +118,14 @@ class G2PDataset(Dataset):
         self.max_src = max_src
         self.max_tgt = max_tgt
         self.lexicon = lexicon
+        self.src_is_prehybrid = src_is_prehybrid
 
     def __len__(self):
         return len(self.pairs)
 
     def __getitem__(self, i):
         text, ipa = self.pairs[i]
-        if self.lexicon is not None:
+        if self.lexicon is not None and not self.src_is_prehybrid:
             text = self.lexicon.build_hybrid_source(text)
         src = self.src_vocab.encode(text, add_sos_eos=False)
         tgt = self.tgt_vocab.encode(ipa, add_sos_eos=True)
@@ -246,15 +263,17 @@ def predict(
     device: torch.device,
     *,
     lexicon: CmuDictLexicon | None = None,
+    source_already_hybrid: bool = False,
     max_decode_len: int = 200,
 ) -> str:
     """Run greedy decoding to convert text to IPA.
 
-    If *lexicon* is set, *text* is converted with ``build_hybrid_source`` first
-    (``<k>…</k>`` for unambiguous dictionary hits, ``<u>…</u>`` otherwise).
+    If *lexicon* is set and *source_already_hybrid* is false, *text* is converted
+    with ``build_hybrid_source`` first. If *source_already_hybrid* is true, *text*
+    is already a hybrid string and *lexicon* is not applied.
     """
     model.eval()
-    if lexicon is not None:
+    if not source_already_hybrid and lexicon is not None:
         text = lexicon.build_hybrid_source(text)
     src = torch.tensor([src_vocab.encode(text)], dtype=torch.long, device=device)
     src_key_padding_mask = (src == CharVocab.PAD_IDX)
@@ -268,6 +287,53 @@ def predict(
             break
         ys.append(next_tok)
     return tgt_vocab.decode(ys, strip_special=True)
+
+
+@torch.no_grad()
+def predict_lexicon_windowed(
+    model: G2PTransformer,
+    src_vocab: CharVocab,
+    tgt_vocab: CharVocab,
+    text: str,
+    device: torch.device,
+    *,
+    lexicon: CmuDictLexicon,
+    unknown_context_chars: int,
+    max_src_len: int = 0,
+    max_decode_len: int = 200,
+) -> str:
+    """Lexicon-on: resolve each ``<u>…</u>`` with a separate encoder pass using *N* chars of hybrid context.
+
+    After each prediction, the span is replaced by ``<k>{ipa}</k>`` so later windows see prior guesses.
+    """
+    h = lexicon.build_hybrid_source(text)
+    while True:
+        m = UNKNOWN_U_RE.search(h)
+        if not m:
+            break
+        i, j = m.start(), m.end()
+        span = m.group(0)
+        lo, hi = hybrid_context_window_bounds(h, i, j, unknown_context_chars)
+        window = h[lo:hi]
+        u_start = i - lo
+        u_end = u_start + len(span)
+        if max_src_len > 0 and len(window) > max_src_len:
+            window, u_start = clip_hybrid_window(window, u_start, u_end, max_src_len)
+        hyp = predict(
+            model,
+            src_vocab,
+            tgt_vocab,
+            window,
+            device,
+            lexicon=None,
+            source_already_hybrid=True,
+            max_decode_len=max_decode_len,
+        )
+        word_ipa = extract_ipa_for_target_unknown(window, u_start, hyp)
+        if not word_ipa:
+            word_ipa = hyp.strip()
+        h = h[:i] + f"<k>{word_ipa}</k>" + h[j:]
+    return hybrid_all_known_to_ipa(h)
 
 
 def main():
@@ -316,6 +382,18 @@ def main():
         action="store_true",
         help="Disable dictionary hybrid source; encoder sees raw text (matches older checkpoints).",
     )
+    parser.add_argument(
+        "--unknown-context-chars",
+        type=int,
+        default=48,
+        metavar="N",
+        help="Hybrid context radius for lexicon window training/inference (tag-aligned expansion).",
+    )
+    parser.add_argument(
+        "--lexicon-train-full-sentence",
+        action="store_true",
+        help="With lexicon: train on full hybrid per row instead of per-unknown windows.",
+    )
     args = parser.parse_args()
 
     if args.resume:
@@ -327,14 +405,14 @@ def main():
 
     data_dir = os.path.abspath(args.data_dir)
     dict_tsv_path = os.path.abspath(args.dict_tsv) if args.dict_tsv else os.path.join(data_dir, "dict.tsv")
-    pairs = load_pairs_from_tsv_dir(data_dir)
-    if args.shuffle_data:
-        random.shuffle(pairs)
-    print(f"Loaded {len(pairs)} (text, IPA) pairs from {data_dir}")
+    pairs_raw = load_pairs_from_tsv_dir(data_dir)
+    if len(pairs_raw) < 100:
+        raise RuntimeError("Too few training pairs in --data-dir (need at least 100).")
 
     resume_dir = args.resume
     lexicon: CmuDictLexicon | None = None
     lexicon_tsv_path: str | None = None
+    ckpt_config: dict = {}
 
     if resume_dir:
         config_path = os.path.join(resume_dir, "config.json")
@@ -357,8 +435,42 @@ def main():
             lexicon_tsv_path = os.path.abspath(tsv)
             lexicon = CmuDictLexicon.from_tsv(lexicon_tsv_path)
             print(f"Lexicon hybrid source enabled ({lexicon_tsv_path})")
-        if len(pairs) < 100:
-            raise RuntimeError("Too few training pairs in --data-dir (need at least 100).")
+    else:
+        if not args.no_lexicon:
+            tsv = dict_tsv_path
+            if not os.path.isfile(tsv):
+                raise FileNotFoundError(
+                    f"Lexicon TSV not found: {tsv!r}. Build it (e.g. build_cmudict_tsv.py -o …/dict.tsv) or pass --no-lexicon."
+                )
+            lexicon_tsv_path = tsv
+            lexicon = CmuDictLexicon.from_tsv(tsv)
+            print(f"Lexicon hybrid source enabled ({lexicon_tsv_path})")
+
+    unknown_n = int(args.unknown_context_chars)
+    lexicon_train_windows = False
+    if lexicon is not None:
+        if resume_dir:
+            unknown_n = int(ckpt_config.get("unknown_context_chars", unknown_n))
+            lexicon_train_windows = bool(ckpt_config.get("lexicon_train_windows", False))
+        else:
+            lexicon_train_windows = not args.lexicon_train_full_sentence
+
+    if lexicon is not None and lexicon_train_windows:
+        pairs: list[tuple[str, str]] = []
+        for text, ipa in pairs_raw:
+            pairs.extend(iter_lexicon_window_training_pairs(text, ipa, lexicon, unknown_n))
+        print(
+            f"Lexicon windowed training: {len(pairs)} window examples from {len(pairs_raw)} TSV rows "
+            f"(context_chars={unknown_n})"
+        )
+    else:
+        pairs = list(pairs_raw)
+
+    if args.shuffle_data:
+        random.shuffle(pairs)
+    print(f"Training on {len(pairs)} (source, IPA) examples from {data_dir}")
+
+    if resume_dir:
         src_vocab = CharVocab.load(os.path.join(resume_dir, "src_vocab.json"))
         tgt_vocab = CharVocab.load(os.path.join(resume_dir, "tgt_vocab.json"))
         model = G2PTransformer(
@@ -384,21 +496,12 @@ def main():
         args.dim_ff = ckpt_config["dim_feedforward"]
         args.dropout = ckpt_config["dropout"]
     else:
-        if len(pairs) < 100:
-            raise RuntimeError("Too few training pairs in --data-dir (need at least 100).")
-        if not args.no_lexicon:
-            tsv = dict_tsv_path
-            if not os.path.isfile(tsv):
-                raise FileNotFoundError(
-                    f"Lexicon TSV not found: {tsv!r}. Build it (e.g. build_cmudict_tsv.py -o …/dict.tsv) or pass --no-lexicon."
-                )
-            lexicon_tsv_path = tsv
-            lexicon = CmuDictLexicon.from_tsv(tsv)
-            print(f"Lexicon hybrid source enabled ({lexicon_tsv_path})")
         src_vocab = CharVocab()
         tgt_vocab = CharVocab()
         for text, ipa in pairs:
-            src_line = lexicon.build_hybrid_source(text) if lexicon is not None else text
+            src_line = text
+            if lexicon is not None and not lexicon_train_windows:
+                src_line = lexicon.build_hybrid_source(text)
             src_vocab.add(src_line)
             tgt_vocab.add(ipa)
         print(f"Source vocab size: {len(src_vocab)}, target vocab size: {len(tgt_vocab)}")
@@ -416,7 +519,15 @@ def main():
         ).to(device)
 
     # Dataset and loader (shared by resume and fresh)
-    dataset = G2PDataset(pairs, src_vocab, tgt_vocab, args.max_src_len, args.max_tgt_len, lexicon=lexicon)
+    dataset = G2PDataset(
+        pairs,
+        src_vocab,
+        tgt_vocab,
+        args.max_src_len,
+        args.max_tgt_len,
+        lexicon=lexicon,
+        src_is_prehybrid=bool(lexicon is not None and lexicon_train_windows),
+    )
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_g2p, num_workers=0)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
@@ -441,6 +552,10 @@ def main():
         "use_lexicon": lexicon is not None,
         "dict_tsv": lexicon_tsv_path,
     }
+    if lexicon is not None:
+        config["unknown_context_chars"] = unknown_n
+        config["lexicon_infer_mode"] = "windowed"
+        config["lexicon_train_windows"] = lexicon_train_windows
     with open(os.path.join(args.out_dir, "config.json"), "w") as f:
         json.dump(config, f)
     print(f"Saved model and vocabs to {args.out_dir}")

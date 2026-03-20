@@ -21,7 +21,7 @@ import torch
 from tqdm import tqdm
 
 from g2p_lexicon import CmuDictLexicon
-from train_g2p import CharVocab, G2PTransformer, predict
+from train_g2p import CharVocab, G2PTransformer, predict, predict_lexicon_windowed
 
 try:
     from datasets import load_dataset
@@ -250,6 +250,18 @@ def main():
         "--output", type=str, default=None,
         help="Optional path to write JSON results",
     )
+    parser.add_argument(
+        "--lexicon-full-sentence",
+        action="store_true",
+        help="With lexicon: single forward pass on the full hybrid (disable per-unknown windows).",
+    )
+    parser.add_argument(
+        "--unknown-context-chars",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Hybrid chars before/after each <u>…</u> for windowed lexicon inference (default: config or 48).",
+    )
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -295,6 +307,10 @@ def main():
             sys.exit(1)
         lexicon = CmuDictLexicon.from_tsv(tsv)
 
+    ctx_n = args.unknown_context_chars
+    if ctx_n is None:
+        ctx_n = int(config.get("unknown_context_chars", 48))
+
     # ------------------------------------------------------------------
     # 2. Fetch OOD data + espeak ground truth
     # ------------------------------------------------------------------
@@ -325,7 +341,19 @@ def main():
 
     for text, ref_ipa in tqdm(pairs, desc="Model inference + metrics"):
         t0 = time.perf_counter()
-        hyp_ipa = predict(model, src_vocab, tgt_vocab, text, device, lexicon=lexicon)
+        if lexicon is not None and not args.lexicon_full_sentence:
+            hyp_ipa = predict_lexicon_windowed(
+                model,
+                src_vocab,
+                tgt_vocab,
+                text,
+                device,
+                lexicon=lexicon,
+                unknown_context_chars=ctx_n,
+                max_src_len=config.get("max_src_len", 0),
+            )
+        else:
+            hyp_ipa = predict(model, src_vocab, tgt_vocab, text, device, lexicon=lexicon)
         t1 = time.perf_counter()
         latency = t1 - t0
         latencies.append(latency)

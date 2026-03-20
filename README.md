@@ -76,6 +76,8 @@ Options:
 | `--resume` | — | Resume from checkpoint in DIR; use the same `--data-dir` as the original run |
 | `--dict-tsv` | `<data-dir>/dict.tsv` | Pronouncing-dictionary TSV for `<k>…</k>` / `<u>…</u>` hybrid sources |
 | `--no-lexicon` | off | Disable hybrid source; raw text only (older checkpoints) |
+| `--unknown-context-chars` | 48 | Context radius for lexicon window training (tag-aligned) and default for inference |
+| `--lexicon-train-full-sentence` | off | With lexicon: train on full hybrid per row instead of one example per `<u>…</u>` |
 
 Example (smaller/faster run):
 
@@ -123,3 +125,5 @@ echo "Hello world" | python infer.py
 ```
 
 Use `--checkpoint-dir` if you saved to a different directory (e.g. `python infer.py --checkpoint-dir out "Hello world"`).
+
+Lexicon-trained checkpoints run **windowed** inference by default: each ``<u>…</u>`` span is predicted in a separate forward pass with ``--unknown-context-chars`` of hybrid text on each side (default 48, tag-aligned expansion so tags are not cut; also stored in `config.json` as `unknown_context_chars`). Training uses the same windowing by default (one loss example per unknown, teacher-forced gold for earlier unknowns). Use ``--lexicon-train-full-sentence`` to train on full hybrid sequences, and ``--lexicon-full-sentence`` at inference for a single pass on the whole hybrid. ``eval_g2p.py`` accepts the same inference flags.
