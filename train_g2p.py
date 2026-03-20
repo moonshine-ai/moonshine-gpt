@@ -1,32 +1,22 @@
 #!/usr/bin/env python3
 """
 Train a small Transformer for grapheme-to-phoneme (G2P): English text → IPA.
-Uses WikiText-2 as the text corpus and py-espeak-ng for IPA ground truth.
+
+Training pairs come from ``*.tsv`` files under ``--data-dir`` (see ``build_corpus_tsv.py``
+and ``build_dictionary_tsv.py``).
 """
 
 import argparse
-import csv
 import json
 import math
 import os
 import random
-import re
-import signal
 
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from tqdm import tqdm
 
-# Optional imports for data
-try:
-    from datasets import load_dataset
-except ImportError:
-    load_dataset = None
-try:
-    from espeakng import ESpeakNG
-except ImportError:
-    ESpeakNG = None
+from g2p_tsv_io import load_pairs_from_tsv_dir
 
 
 # ------------------------------------------------------------------------------
@@ -84,210 +74,6 @@ class CharVocab:
         v.char2idx = data["char2idx"]
         v.idx2char = {int(k): v for k, v in data["idx2char"].items()}
         return v
-
-
-# ------------------------------------------------------------------------------
-# Data: WikiText + espeak-ng IPA
-# ------------------------------------------------------------------------------
-
-def fetch_sentences_from_wikitext(max_sentences: int, config: str = "wikitext-103-raw-v1", min_len: int = 5, max_len: int = 300):
-    """Yield English text lines from WikiText (raw). Use config 'wikitext-103-raw-v1' for ~1.8M lines, 'wikitext-2-raw-v1' for ~37k."""
-    if load_dataset is None:
-        raise ImportError("Install 'datasets': pip install datasets")
-    ds = load_dataset("wikitext", config, split="train")
-    n = 0
-    for ex in ds:
-        text = (ex.get("text") or "").strip()
-        if not text or len(text) < min_len or len(text) > max_len:
-            continue
-        if text.startswith("=") and text.endswith("="):
-            continue
-        yield text
-        n += 1
-        if n >= max_sentences:
-            break
-
-
-def build_ipa_with_espeak(sentences: list[str], voice: str = "en-us") -> list[tuple[str, str]]:
-    """Return list of (text, ipa) using espeak-ng. Skips failures."""
-    if ESpeakNG is None:
-        raise ImportError("Install 'py-espeak-ng' and ensure espeak-ng binary is in PATH")
-    esng = ESpeakNG()
-    esng.voice = voice
-    out = []
-
-    class _G2PTimeout(Exception):
-        """Raised when espeak-ng G2P exceeds per-item timeout."""
-        pass
-
-    def _timeout_handler(signum, frame):
-        raise _G2PTimeout()
-
-    for text in tqdm(sentences, desc="G2P (espeak-ng)"):
-        try:
-            # Enforce a per-item timeout so a hung g2p call doesn't block the run.
-            prev_handler = signal.getsignal(signal.SIGALRM)
-            signal.signal(signal.SIGALRM, _timeout_handler)
-            signal.setitimer(signal.ITIMER_REAL, 1.0)
-            try:
-                ipa = esng.g2p(text, ipa=2)
-            finally:
-                signal.setitimer(signal.ITIMER_REAL, 0)
-                signal.signal(signal.SIGALRM, prev_handler)
-            if ipa and isinstance(ipa, str) and ipa.strip():
-                ipa = ipa.strip()
-                out.append((text, ipa))
-        except _G2PTimeout:
-            continue
-        except Exception:
-            continue
-    return out
-
-
-# ------------------------------------------------------------------------------
-# Data: dictionary word list (single words)
-# ------------------------------------------------------------------------------
-
-# Common column names for word in HF datasets (try in order)
-WORD_COLUMN_CANDIDATES = ("Word", "word", "token", "text", "words")
-
-
-def fetch_words_from_dict(
-    dict_dataset: str, max_words: int, min_len: int = 1, max_len: int = 64, dict_config: str | None = None
-) -> list[str]:
-    """Yield single words from a Hugging Face dataset (e.g. Maximax67/English-Valid-Words)."""
-    if load_dataset is None:
-        raise ImportError("Install 'datasets': pip install datasets")
-    if dict_config:
-        ds = load_dataset(dict_dataset, dict_config, split="train")
-    else:
-        ds = load_dataset(dict_dataset, split="train")
-    if hasattr(ds, "column_names") and ds.column_names:
-        cols = ds.column_names
-        word_col = next((c for c in WORD_COLUMN_CANDIDATES if c in cols), cols[0])
-    else:
-        word_col = "Word"
-    n = 0
-    out = []
-    for ex in ds:
-        w = (ex.get(word_col) or ex.get(word_col.lower()) or "").strip()
-        if not w or len(w) < min_len or len(w) > max_len:
-            continue
-        if not w.isalpha():  # skip if any non-letter
-            continue
-        out.append(w)
-        n += 1
-        if n >= max_words:
-            break
-    return out
-
-
-# ------------------------------------------------------------------------------
-# Cache: TSV with metadata (dataset name + n_sentences) for reuse
-# ------------------------------------------------------------------------------
-
-def _cache_basename(dataset: str, max_sentences: int) -> str:
-    """Safe filename component from dataset config and max_sentences."""
-    safe = re.sub(r"[^\w\-]", "_", dataset)
-    return f"g2p_cache_{safe}_{max_sentences}.tsv"
-
-
-def load_cached_pairs(cache_path: str, dataset: str, max_sentences: int) -> list[tuple[str, str]] | None:
-    """Load (text, ipa) pairs from cache if it exists and matches dataset + max_sentences."""
-    if not os.path.isfile(cache_path):
-        return None
-    pairs = []
-    with open(cache_path, "r", encoding="utf-8", newline="") as f:
-        first = f.readline().strip()
-        if not first.startswith("# dataset=") or " max_sentences=" not in first:
-            return None
-        # Parse "# dataset=wikitext-103-raw-v1 max_sentences=20000"
-        parts = first[2:].strip().split()
-        meta = {}
-        for p in parts:
-            k, v = p.split("=", 1)
-            meta[k] = v
-        if meta.get("dataset") != dataset or meta.get("max_sentences") != str(max_sentences):
-            return None
-        reader = csv.reader(f, delimiter="\t", quoting=csv.QUOTE_MINIMAL)
-        header = next(reader, None)
-        if header != ["text", "ipa"]:
-            return None
-        for row in reader:
-            if len(row) == 2:
-                pairs.append((row[0], row[1]))
-    return pairs if pairs else None
-
-
-def save_cached_pairs(cache_path: str, dataset: str, max_sentences: int, pairs: list[tuple[str, str]]) -> None:
-    """Write (text, ipa) pairs to TSV with metadata header."""
-    d = os.path.dirname(cache_path)
-    if d:
-        os.makedirs(d, exist_ok=True)
-    with open(cache_path, "w", encoding="utf-8", newline="") as f:
-        f.write(f"# dataset={dataset} max_sentences={max_sentences}\n")
-        writer = csv.writer(f, delimiter="\t", quoting=csv.QUOTE_MINIMAL)
-        writer.writerow(["text", "ipa"])
-        writer.writerows(pairs)
-
-
-def _cache_basename_dict(dict_dataset: str, max_words: int, dict_config: str | None = None) -> str:
-    """Safe filename for dictionary G2P cache."""
-    safe = re.sub(r"[^\w\-]", "_", dict_dataset.replace("/", "_"))
-    if dict_config:
-        safe_cfg = re.sub(r"[^\w\-]", "_", dict_config)
-        return f"g2p_cache_dict_{safe}_{safe_cfg}_{max_words}.tsv"
-    return f"g2p_cache_dict_{safe}_{max_words}.tsv"
-
-
-def load_cached_pairs_dict(
-    cache_path: str, dict_dataset: str, max_words: int, dict_config: str | None = None
-) -> list[tuple[str, str]] | None:
-    """Load (word, ipa) pairs from dict cache if it exists and matches."""
-    if not os.path.isfile(cache_path):
-        return None
-    pairs = []
-    with open(cache_path, "r", encoding="utf-8", newline="") as f:
-        first = f.readline().strip()
-        if not first.startswith("# source=dict") or " dataset=" not in first or " max_words=" not in first:
-            return None
-        parts = first[2:].strip().split()
-        meta = {}
-        for p in parts:
-            k, v = p.split("=", 1)
-            meta[k] = v
-        if meta.get("dataset") != dict_dataset or meta.get("max_words") != str(max_words):
-            return None
-        if dict_config is not None and meta.get("config") != dict_config:
-            return None
-        if dict_config is None and meta.get("config") is not None:
-            return None
-        reader = csv.reader(f, delimiter="\t", quoting=csv.QUOTE_MINIMAL)
-        header = next(reader, None)
-        if header != ["text", "ipa"]:
-            return None
-        for row in reader:
-            if len(row) == 2:
-                pairs.append((row[0], row[1]))
-    return pairs if pairs else None
-
-
-def save_cached_pairs_dict(
-    cache_path: str, dict_dataset: str, max_words: int, pairs: list[tuple[str, str]], dict_config: str | None = None
-) -> None:
-    """Write dict (word, ipa) pairs to TSV with metadata header."""
-    d = os.path.dirname(cache_path)
-    if d:
-        os.makedirs(d, exist_ok=True)
-    meta = f"# source=dict dataset={dict_dataset} max_words={max_words}"
-    if dict_config:
-        meta += f" config={dict_config}"
-    meta += "\n"
-    with open(cache_path, "w", encoding="utf-8", newline="") as f:
-        f.write(meta)
-        writer = csv.writer(f, delimiter="\t", quoting=csv.QUOTE_MINIMAL)
-        writer.writerow(["text", "ipa"])
-        writer.writerows(pairs)
 
 
 # ------------------------------------------------------------------------------
@@ -454,11 +240,13 @@ def predict(model: G2PTransformer, src_vocab: CharVocab, tgt_vocab: CharVocab, t
 
 def main():
     parser = argparse.ArgumentParser(description="Train G2P Transformer (text → IPA)")
-    parser.add_argument("--max-sentences", type=int, default=20_000, help="Max training sentences to use")
-    parser.add_argument("--dataset", type=str, default="wikitext-103-raw-v1", choices=["wikitext-2-raw-v1", "wikitext-103-raw-v1"], help="WikiText config: 103 has ~1.8M train lines, 2 has ~37k")
-    parser.add_argument("--dict-dataset", type=str, default="Maximax67/English-Valid-Words", metavar="HF_NAME", help="Add single-word pairs from a HF dataset (e.g. Maximax67/English-Valid-Words)")
-    parser.add_argument("--dict-config", type=str, default="sorted_by_frequency", metavar="CONFIG", help="Config name for --dict-dataset if required (e.g. sorted_by_frequency for Maximax67/English-Valid-Words)")
-    parser.add_argument("--max-dict-words", type=int, default=10_000, help="Max single words to add when --dict-dataset is set")
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        required=True,
+        metavar="DIR",
+        help="Directory containing one or more *.tsv files (text<TAB>ipa); see build_corpus_tsv.py / build_dictionary_tsv.py",
+    )
     parser.add_argument("--max-src-len", type=int, default=256, help="Max source (grapheme) length")
     parser.add_argument("--max-tgt-len", type=int, default=200, help="Max target (IPA) length")
     parser.add_argument("--d-model", type=int, default=256, help="Transformer dimension")
@@ -470,10 +258,19 @@ def main():
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--out-dir", type=str, default="checkpoints", help="Save model and vocabs here (defaults to --resume path when resuming)")
-    parser.add_argument("--resume", type=str, default=None, metavar="DIR", help="Resume training from checkpoint in DIR (loads model, vocabs, config; uses cached data from original run)")
-    parser.add_argument("--cache-dir", type=str, default=".", help="Directory for espeak-ng TSV cache (default: current dir)")
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help="Resume from checkpoint in DIR; pass the same --data-dir as the original run",
+    )
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--voice", type=str, default="en-us", help="espeak-ng voice for IPA")
+    parser.add_argument(
+        "--shuffle-data",
+        action="store_true",
+        help="Shuffle concatenated TSV pairs before training (off by default; DataLoader still shuffles batches)",
+    )
     args = parser.parse_args()
 
     if args.resume:
@@ -483,45 +280,27 @@ def main():
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    data_dir = os.path.abspath(args.data_dir)
+    pairs = load_pairs_from_tsv_dir(data_dir)
+    if args.shuffle_data:
+        random.shuffle(pairs)
+    print(f"Loaded {len(pairs)} (text, IPA) pairs from {data_dir}")
+
     resume_dir = args.resume
     if resume_dir:
-        # Load checkpoint: config, vocabs, model state; then load cached pairs
         config_path = os.path.join(resume_dir, "config.json")
         if not os.path.isfile(config_path):
             raise FileNotFoundError(f"Resume directory must contain config.json: {resume_dir}")
         with open(config_path) as f:
             ckpt_config = json.load(f)
-        dataset_name = ckpt_config.get("dataset") or args.dataset
-        ckpt_max_sentences = ckpt_config.get("max_sentences")
-        if ckpt_max_sentences is not None:
-            ckpt_max_sentences = int(ckpt_max_sentences)
-        else:
-            ckpt_max_sentences = args.max_sentences
-        cache_path = os.path.join(args.cache_dir, _cache_basename(dataset_name, ckpt_max_sentences))
-        pairs = load_cached_pairs(cache_path, dataset_name, ckpt_max_sentences)
-        if pairs is None:
-            raise FileNotFoundError(
-                f"Resume requires cached G2P data. Not found: {cache_path} "
-                f"(dataset={dataset_name}, max_sentences={ckpt_max_sentences}). Run without --resume first to create the cache."
+        saved_data = ckpt_config.get("data_dir")
+        if saved_data and os.path.abspath(saved_data) != data_dir:
+            print(
+                f"Warning: checkpoint data_dir {saved_data!r} differs from --data-dir {data_dir!r}; "
+                "vocabs must still match the data you trained on."
             )
-        print(f"Resuming from {resume_dir}. Using cached data: {len(pairs)} pairs.")
-        dict_dataset_ckpt = ckpt_config.get("dict_dataset")
-        dict_max_words_ckpt = ckpt_config.get("max_dict_words")
-        dict_config_ckpt = ckpt_config.get("dict_config")
-        if dict_dataset_ckpt and dict_max_words_ckpt is not None:
-            dict_max_words_ckpt = int(dict_max_words_ckpt)
-            dict_cache_path = os.path.join(
-                args.cache_dir, _cache_basename_dict(dict_dataset_ckpt, dict_max_words_ckpt, dict_config_ckpt)
-            )
-            dict_pairs = load_cached_pairs_dict(
-                dict_cache_path, dict_dataset_ckpt, dict_max_words_ckpt, dict_config_ckpt
-            )
-            if dict_pairs is not None:
-                pairs = pairs + dict_pairs
-                random.shuffle(pairs)
-                print(f"Added {len(dict_pairs)} dict-word pairs (total {len(pairs)}).")
-            else:
-                print(f"Warning: checkpoint used dict_dataset={dict_dataset_ckpt} but cache not found at {dict_cache_path}; resuming without dict words.")
+        if len(pairs) < 100:
+            raise RuntimeError("Too few training pairs in --data-dir (need at least 100).")
         src_vocab = CharVocab.load(os.path.join(resume_dir, "src_vocab.json"))
         tgt_vocab = CharVocab.load(os.path.join(resume_dir, "tgt_vocab.json"))
         model = G2PTransformer(
@@ -538,10 +317,7 @@ def main():
         ).to(device)
         state_path = os.path.join(resume_dir, "g2p_transformer.pt")
         model.load_state_dict(torch.load(state_path, map_location=device, weights_only=True))
-        print(f"Loaded model from {state_path}")
-        # Use checkpoint config for everything so saved config matches the model
-        args.dataset = dataset_name
-        args.max_sentences = ckpt_max_sentences
+        print(f"Resuming from {resume_dir}. Loaded model from {state_path}")
         args.max_src_len = ckpt_config["max_src_len"]
         args.max_tgt_len = ckpt_config["max_tgt_len"]
         args.d_model = ckpt_config["d_model"]
@@ -549,63 +325,15 @@ def main():
         args.num_layers = ckpt_config["num_layers"]
         args.dim_ff = ckpt_config["dim_feedforward"]
         args.dropout = ckpt_config["dropout"]
-        args.dict_dataset = ckpt_config.get("dict_dataset")
-        args.max_dict_words = int(ckpt_config["max_dict_words"]) if ckpt_config.get("max_dict_words") is not None else getattr(args, "max_dict_words", 10_000)
-        args.dict_config = ckpt_config.get("dict_config")
     else:
-        # 1) Load sentences and get IPA (from cache or espeak-ng)
-        cache_path = os.path.join(args.cache_dir, _cache_basename(args.dataset, args.max_sentences))
-        pairs = load_cached_pairs(cache_path, args.dataset, args.max_sentences)
-        if pairs is not None:
-            print(f"Using cached G2P data from {cache_path} ({len(pairs)} pairs).")
-        else:
-            print(f"Loading sentences from WikiText ({args.dataset})...")
-            sentences = list(fetch_sentences_from_wikitext(args.max_sentences, config=args.dataset, min_len=5, max_len=args.max_src_len))
-            print(f"Got {len(sentences)} sentences. Generating IPA with espeak-ng...")
-            pairs = build_ipa_with_espeak(sentences, voice=args.voice)
-            print(f"Collected {len(pairs)} (text, IPA) pairs. Caching to {cache_path}")
-            save_cached_pairs(cache_path, args.dataset, args.max_sentences, pairs)
-
         if len(pairs) < 100:
-            raise RuntimeError("Too few pairs; install espeak-ng and ensure py-espeak-ng works.")
-
-        # Optional: add single-word pairs from a dictionary dataset
-        if args.dict_dataset:
-            dict_cache_path = os.path.join(
-                args.cache_dir, _cache_basename_dict(args.dict_dataset, args.max_dict_words, getattr(args, "dict_config", None))
-            )
-            dict_pairs = load_cached_pairs_dict(
-                dict_cache_path, args.dict_dataset, args.max_dict_words, getattr(args, "dict_config", None)
-            )
-            if dict_pairs is not None:
-                print(f"Using cached dict words from {dict_cache_path} ({len(dict_pairs)} pairs).")
-            else:
-                print(f"Loading words from dictionary dataset {args.dict_dataset}...")
-                words = fetch_words_from_dict(
-                    args.dict_dataset,
-                    args.max_dict_words,
-                    min_len=1,
-                    max_len=min(64, args.max_src_len),
-                    dict_config=getattr(args, "dict_config", None),
-                )
-                print(f"Got {len(words)} words. Generating IPA with espeak-ng...")
-                dict_pairs = build_ipa_with_espeak(words, voice=args.voice)
-                print(f"Collected {len(dict_pairs)} (word, IPA) pairs. Caching to {dict_cache_path}")
-                save_cached_pairs_dict(
-                    dict_cache_path, args.dict_dataset, args.max_dict_words, dict_pairs, getattr(args, "dict_config", None)
-                )
-            pairs = pairs + dict_pairs
-            random.shuffle(pairs)
-
-        # 2) Build vocabs
+            raise RuntimeError("Too few training pairs in --data-dir (need at least 100).")
         src_vocab = CharVocab()
         tgt_vocab = CharVocab()
         for text, ipa in pairs:
             src_vocab.add(text)
             tgt_vocab.add(ipa)
         print(f"Source vocab size: {len(src_vocab)}, target vocab size: {len(tgt_vocab)}")
-
-        # 3) Model (dataset/loader built below for both branches)
         model = G2PTransformer(
             src_vocab_size=len(src_vocab),
             tgt_vocab_size=len(tgt_vocab),
@@ -641,14 +369,8 @@ def main():
         "dropout": args.dropout,
         "max_src_len": args.max_src_len,
         "max_tgt_len": args.max_tgt_len,
-        "dataset": args.dataset,
-        "max_sentences": args.max_sentences,
+        "data_dir": data_dir,
     }
-    if getattr(args, "dict_dataset", None):
-        config["dict_dataset"] = args.dict_dataset
-        config["max_dict_words"] = getattr(args, "max_dict_words", 10_000)
-        if getattr(args, "dict_config", None):
-            config["dict_config"] = args.dict_config
     with open(os.path.join(args.out_dir, "config.json"), "w") as f:
         json.dump(config, f)
     print(f"Saved model and vocabs to {args.out_dir}")

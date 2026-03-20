@@ -1,11 +1,11 @@
 # G2P Transformer (English text → IPA)
 
-Train a small Transformer that maps English text to IPA phonemes. Training uses **WikiText** (by default WikiText-103, ~1.8M lines) as the text corpus and **espeak-ng** (via the `py-espeak-ng` Python package) to generate ground-truth IPA for each sentence.
+Train a small Transformer that maps English text to IPA phonemes. **Training data** is a folder of tab-separated files (`text<TAB>ipa`). You build those files with two optional pipelines: **WikiText sentences → espeak-ng** (`build_corpus_tsv.py`) and **Hugging Face word list → espeak-ng** (`build_dictionary_tsv.py`).
 
 ## Requirements
 
 - **Python 3.10+**
-- **espeak-ng** must be installed on your system and available in `PATH` (the Python package is a wrapper around the binary).
+- **espeak-ng** must be installed on your system and available in `PATH` when running the dataset build scripts (the Python package is a wrapper around the binary).
 
   - macOS: `brew install espeak-ng`
   - Ubuntu/Debian: `sudo apt install espeak-ng`
@@ -16,23 +16,34 @@ Train a small Transformer that maps English text to IPA phonemes. Training uses 
 pip install -r requirements.txt
 ```
 
-## Training
+## Building training TSVs
 
-Default run (20k sentences, 10 epochs, small transformer):
+Corpus (WikiText lines + IPA):
 
 ```bash
-python train_g2p.py
+python build_corpus_tsv.py -o data/corpus.tsv --max-sentences 20000
+```
+
+Dictionary words + IPA (example HF dataset):
+
+```bash
+python build_dictionary_tsv.py -o data/dictionary.tsv --max-words 10000
+```
+
+Put one or more `*.tsv` files in a directory (e.g. `data/`) and point training at that folder. Files are read in sorted path order and concatenated.
+
+## Training
+
+```bash
+python train_g2p.py --data-dir data
 ```
 
 Options:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--max-sentences` | 20000 | Max training sentences to use |
-| `--dataset` | wikitext-103-raw-v1 | WikiText config: `wikitext-103-raw-v1` (~1.8M lines) or `wikitext-2-raw-v1` (~37k) |
-| `--dict-dataset` | — | Add single-word (text, IPA) pairs from a Hugging Face word list (e.g. `Maximax67/English-Valid-Words`) |
-| `--dict-config` | — | Config name if the dataset requires one (e.g. `sorted_by_frequency` for Maximax67/English-Valid-Words) |
-| `--max-dict-words` | 10000 | Max words to add when `--dict-dataset` is set |
+| `--data-dir` | *(required)* | Directory containing one or more `*.tsv` files (`text<TAB>ipa` after optional `#` comment lines) |
+| `--shuffle-data` | off | Shuffle all pairs after loading (loader still shuffles batches) |
 | `--max-src-len` | 256 | Max grapheme sequence length |
 | `--max-tgt-len` | 200 | Max IPA sequence length |
 | `--d-model` | 256 | Transformer dimension |
@@ -44,26 +55,18 @@ Options:
 | `--epochs` | 10 | Training epochs |
 | `--lr` | 1e-4 | Learning rate |
 | `--out-dir` | checkpoints | Where to save model and vocabs |
-| `--cache-dir` | . | Directory for espeak-ng TSV cache (reused when dataset + max_sentences match) |
-| `--resume` | — | Resume training from checkpoint in DIR (loads model, vocabs, config; reuses cached G2P data from the original run; saves back to DIR) |
-| `--voice` | en-us | espeak-ng voice used for IPA |
+| `--resume` | — | Resume from checkpoint in DIR; use the same `--data-dir` as the original run |
 
 Example (smaller/faster run):
 
 ```bash
-python train_g2p.py --max-sentences 5000 --epochs 5 --batch-size 32 --out-dir out
+python train_g2p.py --data-dir data --epochs 5 --batch-size 32 --out-dir out
 ```
 
-Add single-word examples from a dictionary dataset (cached separately; good for G2P on isolated words). Some datasets require a config (e.g. `Maximax67/English-Valid-Words` needs `--dict-config sorted_by_frequency`):
+Continue training from an existing checkpoint:
 
 ```bash
-python train_g2p.py --dict-dataset Maximax67/English-Valid-Words --dict-config sorted_by_frequency --max-dict-words 15000
-```
-
-Continue training from an existing checkpoint (runs more epochs and saves back to the same dir):
-
-```bash
-python train_g2p.py --resume checkpoints --epochs 5
+python train_g2p.py --data-dir data --resume checkpoints --epochs 5
 ```
 
 Outputs in `--out-dir`:
@@ -71,6 +74,7 @@ Outputs in `--out-dir`:
 - `g2p_transformer.pt` – model state dict
 - `src_vocab.json` – source (grapheme) character vocabulary
 - `tgt_vocab.json` – target (IPA) character vocabulary
+- `config.json` – hyperparameters and `data_dir` (absolute path) for reference
 
 ## Model
 
@@ -78,11 +82,15 @@ Outputs in `--out-dir`:
 - **Character-level** input and output: no subword tokenizer; both text and IPA are encoded as sequences of Unicode characters.
 - Training is **teacher-forced** with cross-entropy on the decoder output.
 
-## Data
+## Data format
 
-- **Source**: Hugging Face `wikitext` dataset. Default config is `wikitext-103-raw-v1` (WikiText-103, ~1.8M train lines); use `--dataset wikitext-2-raw-v1` for the smaller WikiText-2 (~37k lines). Only the train split is used; lines are filtered by length (5–256 chars) and section headers are skipped.
-- **Target**: Each selected line is passed to `espeakng.ESpeakNG().g2p(text, ipa=2)` to obtain IPA. Pairs where `g2p` fails or returns empty are dropped.
-- **Cache**: The (text, IPA) pairs are written to a TSV file under `--cache-dir` (default: current directory), with a first-line header encoding the data source and `max_sentences` (e.g. `# dataset=wikitext-103-raw-v1 max_sentences=20000`). Re-runs with the same `--dataset` and `--max-sentences` reuse this cache and skip espeak-ng. Cache files are named like `g2p_cache_wikitext-103-raw-v1_20000.tsv`.
+Each TSV may start with `#` comment lines, then a header row exactly:
+
+```text
+text	ipa
+```
+
+Then one training pair per row. The loader in `g2p_tsv_io.py` merges every `*.tsv` in `--data-dir`.
 
 ## Inference
 
