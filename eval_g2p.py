@@ -20,6 +20,7 @@ from collections import defaultdict
 import torch
 from tqdm import tqdm
 
+from g2p_lexicon import CmuDictLexicon
 from train_g2p import CharVocab, G2PTransformer, predict
 
 try:
@@ -283,6 +284,17 @@ def main():
     model.eval()
     print(f"Model loaded from {ckpt_dir}  (device={device})")
 
+    lexicon: CmuDictLexicon | None = None
+    if config.get("use_lexicon"):
+        tsv = config.get("dict_tsv") or config.get("cmudict_tsv")
+        if not tsv or not os.path.isfile(tsv):
+            print(
+                f"Checkpoint expects use_lexicon but TSV missing: {tsv!r}. Fix config.json or re-train.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        lexicon = CmuDictLexicon.from_tsv(tsv)
+
     # ------------------------------------------------------------------
     # 2. Fetch OOD data + espeak ground truth
     # ------------------------------------------------------------------
@@ -313,7 +325,7 @@ def main():
 
     for text, ref_ipa in tqdm(pairs, desc="Model inference + metrics"):
         t0 = time.perf_counter()
-        hyp_ipa = predict(model, src_vocab, tgt_vocab, text, device)
+        hyp_ipa = predict(model, src_vocab, tgt_vocab, text, device, lexicon=lexicon)
         t1 = time.perf_counter()
         latency = t1 - t0
         latencies.append(latency)

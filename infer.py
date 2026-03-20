@@ -9,6 +9,7 @@ import sys
 import torch
 
 # Import from train script (same dir)
+from g2p_lexicon import CmuDictLexicon
 from train_g2p import CharVocab, G2PTransformer, predict
 
 
@@ -44,6 +45,17 @@ def main():
     model.to(device)
     model.eval()
 
+    lexicon: CmuDictLexicon | None = None
+    if config.get("use_lexicon"):
+        tsv = config.get("dict_tsv") or config.get("cmudict_tsv")
+        if not tsv or not os.path.isfile(tsv):
+            print(
+                f"Checkpoint expects use_lexicon but TSV missing: {tsv!r}. Re-train or fix config.json.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        lexicon = CmuDictLexicon.from_tsv(tsv)
+
     if args.text:
         text = args.text
     else:
@@ -53,7 +65,7 @@ def main():
         print("No input text.", file=sys.stderr)
         sys.exit(1)
 
-    ipa = predict(model, src_vocab, tgt_vocab, text, device)
+    ipa = predict(model, src_vocab, tgt_vocab, text, device, lexicon=lexicon)
     print(ipa)
 
 

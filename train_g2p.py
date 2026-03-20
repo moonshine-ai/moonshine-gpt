@@ -4,6 +4,11 @@ Train a small Transformer for grapheme-to-phoneme (G2P): English text → IPA.
 
 Training pairs come from ``*.tsv`` files under ``--data-dir`` (see ``build_corpus_tsv.py``
 and ``build_dictionary_tsv.py``).
+
+By default the encoder sees a *hybrid* source built from the lexicon TSV (``--dict-tsv``,
+default ``<data-dir>/dict.tsv``): dictionary
+entries with a single IPA are wrapped as ``<k>…</k>``; ambiguous / OOV tokens and
+punctuation use ``<u>…</u>``. Use ``--no-lexicon`` for raw grapheme input only.
 """
 
 import argparse
@@ -16,6 +21,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
+from g2p_lexicon import CmuDictLexicon
 from g2p_tsv_io import load_pairs_from_tsv_dir
 
 
@@ -81,18 +87,29 @@ class CharVocab:
 # ------------------------------------------------------------------------------
 
 class G2PDataset(Dataset):
-    def __init__(self, pairs: list[tuple[str, str]], src_vocab: CharVocab, tgt_vocab: CharVocab, max_src: int, max_tgt: int):
+    def __init__(
+        self,
+        pairs: list[tuple[str, str]],
+        src_vocab: CharVocab,
+        tgt_vocab: CharVocab,
+        max_src: int,
+        max_tgt: int,
+        lexicon: CmuDictLexicon | None = None,
+    ):
         self.pairs = pairs
         self.src_vocab = src_vocab
         self.tgt_vocab = tgt_vocab
         self.max_src = max_src
         self.max_tgt = max_tgt
+        self.lexicon = lexicon
 
     def __len__(self):
         return len(self.pairs)
 
     def __getitem__(self, i):
         text, ipa = self.pairs[i]
+        if self.lexicon is not None:
+            text = self.lexicon.build_hybrid_source(text)
         src = self.src_vocab.encode(text, add_sos_eos=False)
         tgt = self.tgt_vocab.encode(ipa, add_sos_eos=True)
         src = src[: self.max_src]
@@ -221,9 +238,24 @@ def train_epoch(model, loader, optimizer, device, pad_idx):
 
 
 @torch.no_grad()
-def predict(model: G2PTransformer, src_vocab: CharVocab, tgt_vocab: CharVocab, text: str, device: torch.device, max_decode_len: int = 200) -> str:
-    """Run greedy decoding to convert text to IPA."""
+def predict(
+    model: G2PTransformer,
+    src_vocab: CharVocab,
+    tgt_vocab: CharVocab,
+    text: str,
+    device: torch.device,
+    *,
+    lexicon: CmuDictLexicon | None = None,
+    max_decode_len: int = 200,
+) -> str:
+    """Run greedy decoding to convert text to IPA.
+
+    If *lexicon* is set, *text* is converted with ``build_hybrid_source`` first
+    (``<k>…</k>`` for unambiguous dictionary hits, ``<u>…</u>`` otherwise).
+    """
     model.eval()
+    if lexicon is not None:
+        text = lexicon.build_hybrid_source(text)
     src = torch.tensor([src_vocab.encode(text)], dtype=torch.long, device=device)
     src_key_padding_mask = (src == CharVocab.PAD_IDX)
     memory = model.encode(src, src_key_padding_mask=src_key_padding_mask)
@@ -271,6 +303,19 @@ def main():
         action="store_true",
         help="Shuffle concatenated TSV pairs before training (off by default; DataLoader still shuffles batches)",
     )
+    parser.add_argument(
+        "--dict-tsv",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Pronouncing-dictionary TSV (text, ipa, …); unambiguous spellings → <k>…</k> in the encoder. "
+        "Default: <data-dir>/dict.tsv",
+    )
+    parser.add_argument(
+        "--no-lexicon",
+        action="store_true",
+        help="Disable dictionary hybrid source; encoder sees raw text (matches older checkpoints).",
+    )
     args = parser.parse_args()
 
     if args.resume:
@@ -281,12 +326,16 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     data_dir = os.path.abspath(args.data_dir)
+    dict_tsv_path = os.path.abspath(args.dict_tsv) if args.dict_tsv else os.path.join(data_dir, "dict.tsv")
     pairs = load_pairs_from_tsv_dir(data_dir)
     if args.shuffle_data:
         random.shuffle(pairs)
     print(f"Loaded {len(pairs)} (text, IPA) pairs from {data_dir}")
 
     resume_dir = args.resume
+    lexicon: CmuDictLexicon | None = None
+    lexicon_tsv_path: str | None = None
+
     if resume_dir:
         config_path = os.path.join(resume_dir, "config.json")
         if not os.path.isfile(config_path):
@@ -299,6 +348,15 @@ def main():
                 f"Warning: checkpoint data_dir {saved_data!r} differs from --data-dir {data_dir!r}; "
                 "vocabs must still match the data you trained on."
             )
+        if ckpt_config.get("use_lexicon"):
+            tsv = ckpt_config.get("dict_tsv") or ckpt_config.get("cmudict_tsv")
+            if not tsv or not os.path.isfile(tsv):
+                raise FileNotFoundError(
+                    f"Checkpoint was trained with use_lexicon but dict TSV missing: {tsv!r}"
+                )
+            lexicon_tsv_path = os.path.abspath(tsv)
+            lexicon = CmuDictLexicon.from_tsv(lexicon_tsv_path)
+            print(f"Lexicon hybrid source enabled ({lexicon_tsv_path})")
         if len(pairs) < 100:
             raise RuntimeError("Too few training pairs in --data-dir (need at least 100).")
         src_vocab = CharVocab.load(os.path.join(resume_dir, "src_vocab.json"))
@@ -328,10 +386,20 @@ def main():
     else:
         if len(pairs) < 100:
             raise RuntimeError("Too few training pairs in --data-dir (need at least 100).")
+        if not args.no_lexicon:
+            tsv = dict_tsv_path
+            if not os.path.isfile(tsv):
+                raise FileNotFoundError(
+                    f"Lexicon TSV not found: {tsv!r}. Build it (e.g. build_cmudict_tsv.py -o …/dict.tsv) or pass --no-lexicon."
+                )
+            lexicon_tsv_path = tsv
+            lexicon = CmuDictLexicon.from_tsv(tsv)
+            print(f"Lexicon hybrid source enabled ({lexicon_tsv_path})")
         src_vocab = CharVocab()
         tgt_vocab = CharVocab()
         for text, ipa in pairs:
-            src_vocab.add(text)
+            src_line = lexicon.build_hybrid_source(text) if lexicon is not None else text
+            src_vocab.add(src_line)
             tgt_vocab.add(ipa)
         print(f"Source vocab size: {len(src_vocab)}, target vocab size: {len(tgt_vocab)}")
         model = G2PTransformer(
@@ -348,7 +416,7 @@ def main():
         ).to(device)
 
     # Dataset and loader (shared by resume and fresh)
-    dataset = G2PDataset(pairs, src_vocab, tgt_vocab, args.max_src_len, args.max_tgt_len)
+    dataset = G2PDataset(pairs, src_vocab, tgt_vocab, args.max_src_len, args.max_tgt_len, lexicon=lexicon)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_g2p, num_workers=0)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
@@ -370,6 +438,8 @@ def main():
         "max_src_len": args.max_src_len,
         "max_tgt_len": args.max_tgt_len,
         "data_dir": data_dir,
+        "use_lexicon": lexicon is not None,
+        "dict_tsv": lexicon_tsv_path,
     }
     with open(os.path.join(args.out_dir, "config.json"), "w") as f:
         json.dump(config, f)

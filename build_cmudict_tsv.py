@@ -11,7 +11,9 @@ Inline `` # `` comments on dictionary lines are removed before parsing.
 
 By default writes three columns: ``text``, ``ipa``, and ``ambiguous`` (``true`` if
 that spelling has more than one distinct IPA in CMUdict after conversion, else
-``false``). ``train_g2p.py`` / ``g2p_tsv_io`` still load only the first two columns.
+``false``). For training, place it as ``<data-dir>/dict.tsv`` (or pass ``--dict-tsv``);
+``load_pairs_from_tsv_dir`` skips ``dict.tsv`` (and legacy ``cmudict.tsv``) so word-list rows
+are not mixed with sentence data.
 
 Use ``--no-ambiguous-column`` for a strict two-column file like other dataset scripts.
 """

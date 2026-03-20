@@ -8,6 +8,9 @@ import os
 
 HEADER = ["text", "ipa"]
 
+# Basenames skipped when loading a training directory (lexicon export, not parallel text).
+_LEXICON_TSV_BASENAMES = frozenset({"dict.tsv", "cmudict.tsv"})
+
 
 def write_tsv_table(
     path: str,
@@ -36,12 +39,17 @@ def load_pairs_from_tsv_dir(data_dir: str) -> list[tuple[str, str]]:
     Each file must contain optional ``#`` comment lines, then a header row whose
     first two columns are ``text`` and ``ipa`` (extra columns are ignored), then
     one pair per row.
+
+    Lexicon TSVs ``dict.tsv`` (and legacy ``cmudict.tsv``) are omitted: they are for
+    ``--dict-tsv`` / hybrid lookup, not sentence-level training pairs.
     """
     if not os.path.isdir(data_dir):
         raise FileNotFoundError(f"Data directory not found: {data_dir}")
     paths = sorted(glob.glob(os.path.join(data_dir, "*.tsv")))
+    skip = {n.casefold() for n in _LEXICON_TSV_BASENAMES}
+    paths = [p for p in paths if os.path.basename(p).casefold() not in skip]
     if not paths:
-        raise FileNotFoundError(f"No *.tsv files in {data_dir}")
+        raise FileNotFoundError(f"No *.tsv files in {data_dir} (after excluding lexicon TSVs)")
     pairs: list[tuple[str, str]] = []
     for path in paths:
         pairs.extend(_load_pairs_from_tsv_file(path))

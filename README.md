@@ -40,7 +40,7 @@ python build_librig2p_nostress_tsv.py -o data/librig2p_lex.tsv --split lexicon_t
 [CMU Pronouncing Dictionary](https://github.com/cmusphinx/cmudict) (`cmudict.dict` from GitHub by default):
 
 ```bash
-python build_cmudict_tsv.py -o data/cmudict.tsv
+python build_cmudict_tsv.py -o data/dict.tsv
 # optional: --cmudict-path ./cmudict.dict  --lowercase  --download-cache ~/.cache/cmudict.dict
 # default TSV has a third column ``ambiguous`` (true/false); training still uses only text+ipa
 # use --no-ambiguous-column for a two-column file
@@ -48,7 +48,7 @@ python build_cmudict_tsv.py -o data/cmudict.tsv
 
 Phoneme tokens (`phn`) are treated as stress-free ARPAbet (trailing `0`/`1`/`2` stripped if present), mapped to IPA, and concatenated into one string per example so the target side stays character-level like the other TSV builders. IPA symbols and conventions can differ from espeak-ng; mixing this TSV with espeak-built TSVs in one `--data-dir` is allowed but may widen the target alphabet. CMUdict and LibriG2P exports share the same mapping in `arpabet_ipa.py`.
 
-Put one or more `*.tsv` files in a directory (e.g. `data/`) and point training at that folder. Files are read in sorted path order and concatenated.
+Put one or more `*.tsv` files in a directory (e.g. `data/`) and point training at that folder. Files are read in sorted path order and concatenated. The lexicon file `dict.tsv` in that folder (if present) is **not** loaded as training rows; it is used only for hybrid encoder input (see `--dict-tsv`).
 
 ## Training
 
@@ -74,6 +74,8 @@ Options:
 | `--lr` | 1e-4 | Learning rate |
 | `--out-dir` | checkpoints | Where to save model and vocabs |
 | `--resume` | — | Resume from checkpoint in DIR; use the same `--data-dir` as the original run |
+| `--dict-tsv` | `<data-dir>/dict.tsv` | Pronouncing-dictionary TSV for `<k>…</k>` / `<u>…</u>` hybrid sources |
+| `--no-lexicon` | off | Disable hybrid source; raw text only (older checkpoints) |
 
 Example (smaller/faster run):
 
